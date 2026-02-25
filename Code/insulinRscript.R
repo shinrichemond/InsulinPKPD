@@ -18,19 +18,20 @@ base_params <- list(
   
   kclr = 0.15,  # Insulin Plasma clearence as waste from kidney, liver, etc...
   kenz = 0.08,  # Insulin Plasma enzymatic degredation
+  I_basal = 0.5,# Insulin-Glucose feedback term
   
   Vc = 5.0,     # Volume of central plasma
   
   Emax = 3.0,   # maximum endogenous glucose production
-  EC50 = 120,   # half saturation term for glucose production
+  EC50 = 90,    # half saturation term for glucose production
   hillN = 2.5,  # saturation power term
   
   IC50 = 25,    # half saturation term for glucose secretion inhibition
   
-  Gb = 1.8,     # Basal glucose production
-  Umax = 5.5,   # Maximal glucose uptake
-  KP = 15,      # Half saturation for insulin in utilization
-  KG = 80       # Hald saturation for glucose in utilization
+  Gb = 0.3,     # Basal glucose production
+  Umax = 8.0,   # Maximal glucose uptake
+  KP = 10,      # Half saturation for insulin in utilization
+  KG = 80       # Half saturation for glucose in utilization
 )
 
 # Site Profiles
@@ -44,11 +45,11 @@ site_profiles <- data.frame(
 
 # Exogenous Input parameters (Glucose + Insulin)
 meal_times  <- c(8, 13, 19)        # breakfast, lunch, dinner (hours in day)
-meal_sizes  <- c(50, 40, 55)       # glucose load scale
-meal_durs   <- c(0.75, 0.75, 1.0)  # absorption windows
+meal_sizes  <- c(25, 35, 30)       # glucose load scale
+meal_durs   <- c(1.0, 1.0, 1.0)    # absorption windows
 
 dose_times  <- c(7.75, 12.75, 18.75)  # pre-meal injections
-dose_sizes  <- c(10, 8, 10)
+dose_sizes  <- c(7, 8, 7)
 inj_dur <- 0.05   # 3 min
 
 # Main System ODE
@@ -96,7 +97,7 @@ insulin_ode <- function(t, state, params) {
     
     # Main ODEs
     dS <- u_input - kabs - kdeg * S_pos + kre * P_pos
-    dP <- Vc * (kabs + E_G * C_t) - kclr * P_pos - kenz * P_pos - kre * P_pos
+    dP <- Vc * (kabs + E_G * C_t + I_basal) - kclr * P_pos - kenz * P_pos - kre * P_pos
     dG <- Gb + G_in - U_PG
     
     # Return
@@ -121,7 +122,7 @@ state0 <- c(
 
 # Time God
 day_length <- 24
-end_day <- 7
+end_day <- 31
 t_end <- day_length * end_day     # run for however many days
 dt    <- 1/60                     # set time resolution
 times <- seq(0, t_end, by = dt)
@@ -141,3 +142,7 @@ out <- ode(
 )
 
 out_df <- as.data.frame(out)
+
+ggplot(out_df, aes(x = time/24, y = G)) +
+  geom_line() +
+  theme_minimal()

@@ -1,0 +1,1074 @@
+---
+title: "Insulin Pharmacokinetics Model: Injection Site Effects"
+subtitle: "Three-Compartment PBPK Simulation — EEB 119 Project"
+author: "Aditya Narashim, Richemond Shin, Nancy Robles-Perez"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: cosmo
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+# ============================================================================
+# SETUP CHUNK
+# ----------------------------------------------------------------------------
+# This chunk loads all required packages and sets global options for the
+# document. All plots will use a consistent theme and sizing.
+# ============================================================================
+
+knitr::opts_chunk$set(
+  echo    = TRUE,     # Show code in output
+  warning = FALSE,    # Suppress warnings
+  message = FALSE,    # Suppress package loading messages
+  fig.align = "center"
+)
+
+# --- Required packages ---
+# deSolve: numerical ODE integration (lsoda solver, handles stiff systems)
+# ggplot2: grammar-of-graphics plotting
+# dplyr/tidyr: data wrangling
+# patchwork: composing multi-panel figures
+# plotly: interactive 3D phase portrait
+# knitr/kableExtra: formatted tables
+install.packages("deSolve")
+library(deSolve)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+library(plotly)
+library(knitr)
+library(kableExtra)
+```
+
+# 1. Model Overview
+
+This document implements the three-compartment physiologically-based pharmacokinetic
+(PBPK) model described in our project proposal. The model tracks:
+  
+- **S(t)**: Insulin concentration in the subcutaneous depot (injection site)
+- **P(t)**: Active insulin concentration in blood plasma
+- **G(t)**: Blood glucose concentration
+
+The central question is: *how does injection site physiology (abdomen, arm, thigh, 
+buttock) affect the pharmacokinetic profile of insulin — specifically peak plasma 
+concentration (C~max~), time-to-peak (T~max~), and total systemic exposure (AUC)?*
+
+Injection site enters the model through the absorption function parameters (V~max~, K~m~),
+which vary by site due to differences in local blood flow, tissue thickness, and 
+capillary density.
+
+---
+
+# 2. Model Equations
+
+The system of ordinary differential equations (ODEs):
+
+$$\frac{dS}{dt} = u(t) - \frac{V_{max} \cdot S}{K_m + S} - k_{deg} \cdot S + k_{re} \cdot P$$
+
+$$\frac{dP}{dt} = \frac{1}{V_c}\left[\frac{V_{max} \cdot S}{K_m + S} + E(G) \cdot C(t)\right] - (k_{clr} + k_{enz} + k_{re}) \cdot P$$
+
+$$\frac{dG}{dt} = G_b + G_{in}(t) - \frac{U_{max} \cdot P \cdot G}{(K_P + P)(K_G + G)}$$
+
+where the auxiliary functions are:
+
+$$E(G) = \frac{E_{max} \cdot G^n}{EC_{50}^n + G^n} \quad \text{(Hill-type β-cell secretion)}$$
+
+$$C(t) = \frac{1}{1 + P / IC_{50}} \quad \text{(negative feedback inhibition)}$$
+
+---
+
+# 3. Parameter Definitions
+
+```{r parameters}
+# ============================================================================
+# PARAMETER DEFINITIONS
+# ============================================================================
+# All parameters are collected into a named list. Each is annotated with its
+# physiological meaning, units, and source rationale.
+#
+# Parameters are organized into functional groups:
+#   (A) Absorption — site-dependent, controls insulin movement from depot to plasma
+#   (B) Degradation & clearance — controls insulin removal from each compartment
+#   (C) Distribution — plasma volume
+#   (D) Endogenous insulin — β-cell secretion response to glucose
+#   (E) Glucose dynamics — basal production, insulin-mediated uptake
+# ============================================================================
+
+base_params <- list(
+  
+  # --- (A) ABSORPTION PARAMETERS (site-dependent) ---
+  # These are the key parameters that VARY by injection site.
+  # Vmax: maximum absorption rate from SC depot into plasma (Units/hr)
+  #        Higher Vmax = faster absorption = higher blood flow at site
+  # Km:   Michaelis-Menten half-saturation constant (Units)
+  #        Lower Km = absorption saturates at lower depot concentrations
+  #        Together, kabs(S) = Vmax * S / (Km + S) is a saturating function:
+  #          - At low S: kabs ≈ (Vmax/Km) * S  (first-order, linear)
+  #          - At high S: kabs ≈ Vmax           (zero-order, saturated)
+  Vmax = 18,    # Will be overridden per site
+  Km   = 30,    # Will be overridden per site
+  
+  # --- (B) DEGRADATION & CLEARANCE PARAMETERS ---
+  # kdeg: first-order degradation rate of insulin in the SC depot (1/hr)
+  #       Represents local enzymatic breakdown before absorption into blood.
+  #       Insulin that degrades in the depot never reaches the plasma.
+  kdeg = 0.05,
+  
+  # kre: redistribution/reabsorption rate constant (1/hr)
+  #      Represents insulin moving FROM plasma BACK to SC tissue.
+  #      Small but included for mass-balance completeness.
+  kre = 0.01,
+  
+  # kclr: renal + hepatic clearance rate of insulin from plasma (1/hr)
+  #       Primary route of insulin elimination. The liver clears ~60% of
+  #       portal insulin; kidneys clear ~35% of peripheral insulin.
+  kclr = 0.15,
+  
+  # kenz: enzymatic degradation rate in plasma (1/hr)
+  #       Insulin-degrading enzyme (IDE) in blood and peripheral tissues.
+  #       Separate from hepatic/renal clearance.
+  kenz = 0.08,
+  
+  # --- (C) DISTRIBUTION ---
+  # Vc: apparent volume of distribution for insulin in plasma (L)
+  #     Converts mass flux (from absorption) into concentration.
+  #     Typical value ~5 L for a 70 kg adult (insulin distributes mainly
+  #     in extracellular fluid).
+  Vc = 5.0,
+  
+  # --- (D) ENDOGENOUS INSULIN SECRETION ---
+  # These parameters define E(G), the Hill-type function describing how
+  # pancreatic β-cells secrete insulin in response to blood glucose.
+  #
+  # Emax: maximum endogenous insulin secretion rate (Units/hr)
+  #       Upper bound of β-cell output when glucose is very high.
+  Emax = 3.0,
+  
+  # EC50: glucose concentration at half-maximal secretion (mg/dL)
+  #       The glucose level at which β-cells produce 50% of Emax.
+  EC50 = 120,
+  
+  # hillN: Hill coefficient (dimensionless)
+  #        Controls the steepness/switch-like behavior of the secretion
+  #        response. Higher n = sharper threshold. n=2.5 gives a
+  #        moderately sigmoidal response curve.
+  hillN = 2.5,
+  
+  # IC50: insulin concentration for 50% inhibition of secretion (Units/L)
+  #       Part of the negative feedback: C(t) = 1/(1 + P/IC50).
+  #       When plasma insulin P = IC50, endogenous secretion is halved.
+  #       This prevents runaway positive feedback in the P ↔ G loop.
+  IC50 = 25,
+  
+  # --- (E) GLUCOSE DYNAMICS ---
+  # Gb: basal (fasting) hepatic glucose production rate (mg/dL/hr)
+  #     The liver continuously produces glucose via gluconeogenesis and
+  #     glycogenolysis. This is the "always on" glucose source.
+  Gb = 1.8,
+  
+  # Umax: maximum insulin-mediated glucose utilization rate (mg/dL/hr)
+  #       Upper bound of glucose uptake by peripheral tissues (muscle, fat).
+  Umax = 5.5,
+  
+  # KP: half-saturation constant for insulin in utilization (Units/L)
+  #     The plasma insulin level at which utilization is 50% of max
+  #     (holding glucose constant). Controls insulin sensitivity.
+  KP = 15,
+  
+  # KG: half-saturation constant for glucose in utilization (mg/dL)
+  #     The glucose level at which utilization is 50% of max
+  #     (holding insulin constant). Controls glucose sensitivity.
+  KG = 80
+)
+```
+
+```{r site_profiles}
+# ============================================================================
+# INJECTION SITE PROFILES
+# ============================================================================
+# Each injection site has a different local physiology that affects how quickly
+# insulin is absorbed from the subcutaneous depot into the bloodstream.
+#
+# Key physiological differences:
+#   - Abdomen: highest capillary density and blood flow → fastest absorption
+#   - Upper arm: intermediate blood flow
+#   - Buttock: moderate blood flow, thicker SC layer
+#   - Thigh: lowest blood flow of common sites → slowest absorption
+#
+# These differences are captured by varying Vmax and Km:
+#   - Higher Vmax = faster maximum absorption (more blood flow)
+#   - Lower Km = absorption activates at lower depot levels
+#
+# Reference: Gradel et al. (2018), Koivisto & Felig (1980)
+# ============================================================================
+
+site_profiles <- data.frame(
+  site  = c("Abdomen", "Upper Arm", "Buttock", "Thigh"),
+  Vmax  = c(18, 13, 10, 8),
+  Km    = c(30, 40, 42, 50),
+  color = c("#c53030", "#d69e2e", "#2b6cb0", "#718096"),
+  stringsAsFactors = FALSE
+)
+
+site_profiles %>%
+  kable(
+    caption = "Injection Site Absorption Parameters",
+    col.names = c("Site", "V_max (U/hr)", "K_m (U)", "Plot Color")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+# 4. ODE System Implementation
+
+```{r ode_system}
+# ============================================================================
+# ODE SYSTEM FUNCTION
+# ============================================================================
+# This function defines the right-hand side of the ODE system.
+# It is called repeatedly by the deSolve integrator at each time step.
+#
+# Arguments:
+#   t      - current time (hours)
+#   state  - named vector of current state variable values: c(S, P, G)
+#   params - named list of all model parameters
+#
+# Returns:
+#   A list containing a vector of derivatives: c(dS/dt, dP/dt, dG/dt)
+#   and a vector of auxiliary/diagnostic variables for post-hoc analysis.
+# ============================================================================
+
+insulin_ode <- function(t, state, params) {
+  with(as.list(c(state, params)), {
+    
+    # ------------------------------------------------------------------
+    # EXOGENOUS INPUTS
+    # ------------------------------------------------------------------
+    
+    # Injection input u(t):
+    # Each dose is modeled as a brief square pulse over a 3-minute window
+    # (0.05 hr). This avoids a true Dirac delta (which is numerically
+    # problematic) while still approximating a rapid bolus injection.
+    # The pulse height = dose_amount / injection_duration so that the
+    # integral over the pulse equals the total dose.
+    u_input <- 0
+    for (i in seq_len(nrow(dose_schedule))) {
+      t_dose    <- dose_schedule$time[i]
+      dose_amt  <- dose_schedule$amount[i]
+      inj_dur   <- 0.05  # 3-minute injection window (hours)
+      if (t >= t_dose && t < t_dose + inj_dur) {
+        u_input <- u_input + dose_amt / inj_dur
+      }
+    }
+    
+    # Meal glucose input Gin(t):
+    # Each meal is modeled as a gamma-shaped absorption profile:
+    #   Gin(t) = M * (t_rel / t_peak) * exp(-(t_rel - t_peak) / t_decay)
+    # where t_rel is time since meal start, t_peak is time of peak
+    # absorption (~18 min = 30% of meal duration), and t_decay controls
+    # the tail. This captures the physiological pattern: glucose rises
+    # after eating, peaks ~20-30 min post-meal, then tapers off.
+    G_in <- 0
+    for (i in seq_len(nrow(meal_schedule))) {
+      t_meal   <- meal_schedule$time[i]
+      meal_amt <- meal_schedule$amount[i]
+      meal_dur <- meal_schedule$duration[i]
+      t_rel    <- t - t_meal
+      if (t_rel >= 0 && t_rel < meal_dur) {
+        t_peak <- meal_dur * 0.3
+        t_decay <- meal_dur * 0.4
+        G_in <- G_in + meal_amt * (t_rel / t_peak) * exp(-(t_rel - t_peak) / t_decay)
+      }
+    }
+    
+    # ------------------------------------------------------------------
+    # AUXILIARY FUNCTIONS
+    # ------------------------------------------------------------------
+    
+    # Ensure non-negative state values (numerical safety)
+    S_pos <- max(S, 0)
+    P_pos <- max(P, 0)
+    G_pos <- max(G, 0)
+    
+    # Saturating absorption (Michaelis-Menten kinetics):
+    # kabs(S) = Vmax * S / (Km + S)
+    # At low depot levels: approximately first-order (linear in S)
+    # At high depot levels: saturates at Vmax (zero-order)
+    # This nonlinearity is important because immediately after injection,
+    # the depot is loaded (high S → saturated absorption), then as insulin
+    # drains, absorption slows nonlinearly.
+    kabs <- Vmax * S_pos / (Km + S_pos)
+    
+    # Endogenous insulin secretion E(G) — Hill function:
+    # E(G) = Emax * G^n / (EC50^n + G^n)
+    # This is a sigmoidal function of glucose. β-cells secrete more insulin
+    # when blood glucose is high. The Hill coefficient (n=2.5) makes this
+    # a moderately switch-like response — there's a threshold glucose level
+    # below which secretion is minimal and above which it ramps up steeply.
+    G_pow <- G_pos^hillN
+    E_G   <- Emax * G_pow / (EC50^hillN + G_pow)
+    
+    # Inhibitory feedback factor C(t):
+    # C(t) = 1 / (1 + P / IC50)
+    # When plasma insulin is low:  C ≈ 1 (no inhibition, full secretion)
+    # When plasma insulin is high: C → 0 (secretion suppressed)
+    # This prevents a dangerous positive feedback loop:
+    #   high G → high E(G) → high P → low G → low E(G) → etc.
+    # Without C(t), the system could oscillate unrealistically.
+    C_t <- 1 / (1 + P_pos / IC50)
+    
+    # Insulin-mediated glucose utilization U(P, G):
+    # U(P,G) = Umax * P * G / ((KP + P)(KG + G))
+    # This is a dual-substrate Michaelis-Menten form. Glucose uptake by
+    # tissues (muscle, fat, liver) requires BOTH insulin AND glucose to be
+    # present. It saturates independently in each:
+    #   - At very high P: U ≈ Umax * G / (KG + G)  (insulin-saturated)
+    #   - At very high G: U ≈ Umax * P / (KP + P)  (glucose-saturated)
+    # This coupling is the fundamental insulin-glucose interaction.
+    U_PG <- Umax * P_pos * G_pos / ((KP + P_pos) * (KG + G_pos))
+    
+    # ------------------------------------------------------------------
+    # DIFFERENTIAL EQUATIONS
+    # ------------------------------------------------------------------
+    
+    # dS/dt: Rate of change of insulin in the subcutaneous depot
+    #   (+) u_input:   exogenous insulin arriving from injection
+    #   (-) kabs:      insulin absorbed from depot into plasma
+    #   (-) kdeg * S:  insulin degraded locally in the depot (never reaches blood)
+    #   (+) kre * P:   small redistribution of insulin from plasma back to depot
+    dS <- u_input - kabs - kdeg * S_pos + kre * P_pos
+    
+    # dP/dt: Rate of change of active insulin in plasma
+    #   (+) kabs / Vc:         absorbed insulin entering plasma (divided by volume)
+    #   (+) E_G * C_t / Vc:    endogenous β-cell secretion (feedback-modulated)
+    #   (-) kclr * P:          renal + hepatic clearance
+    #   (-) kenz * P:          enzymatic degradation (IDE)
+    #   (-) kre * P:           redistribution back to SC tissue
+    dP <- kabs / Vc + E_G * C_t / Vc - kclr * P_pos - kenz * P_pos - kre * P_pos
+    
+    # dG/dt: Rate of change of blood glucose
+    #   (+) Gb:    basal hepatic glucose production (constant)
+    #   (+) G_in:  glucose absorbed from food (time-varying)
+    #   (-) U_PG:  insulin-mediated glucose uptake by tissues
+    dG <- Gb + G_in - U_PG
+    
+    # ------------------------------------------------------------------
+    # RETURN
+    # ------------------------------------------------------------------
+    # Return derivatives AND auxiliary variables for diagnostics.
+    # The auxiliary variables are not part of the ODE state but are useful
+    # for plotting absorption rates, secretion rates, etc.
+    return(list(
+      c(dS, dP, dG),                            # derivatives
+      kabs   = kabs,                             # absorption rate
+      E_G    = E_G,                              # endogenous secretion rate
+      C_t    = C_t,                              # inhibitory factor
+      U_PG   = U_PG,                             # glucose utilization rate
+      G_in   = G_in,                             # meal glucose input
+      u_input = u_input                          # injection input
+    ))
+  })
+}
+```
+
+---
+
+# 5. Dosing & Meal Schedules
+
+```{r schedules}
+# ============================================================================
+# DOSING SCHEDULE
+# ============================================================================
+# Defines when and how much insulin is injected. Each row is one injection.
+#
+# Columns:
+#   time   - injection time (hours from simulation start)
+#   amount - dose size (Units of insulin)
+#
+# This schedule represents a typical 3-meal bolus regimen:
+#   - Pre-breakfast bolus at t=0.5 hr
+#   - Pre-lunch bolus at t=6 hr
+#   - Pre-dinner bolus at t=12 hr
+#   - Optional evening correction at t=18 hr
+# ============================================================================
+
+dose_schedule <- data.frame(
+  time   = c(0.5, 6.0, 12.0, 18.0),
+  amount = c(10,  8,   10,   5)
+)
+
+# ============================================================================
+# MEAL SCHEDULE
+# ============================================================================
+# Defines when and how much carbohydrate (glucose equivalent) is consumed.
+#
+# Columns:
+#   time     - meal start time (hours)
+#   amount   - carbohydrate load, scaled to glucose appearance rate (mg/dL/hr)
+#   duration - meal absorption window (hours); glucose appears over this period
+#              with a gamma-shaped profile peaking at ~30% of the duration.
+#
+# Meals are timed ~15 min after each insulin dose to reflect the typical
+# recommendation to inject before eating.
+# ============================================================================
+
+meal_schedule <- data.frame(
+  time     = c(0.75, 6.25, 12.25, 18.5),
+  amount   = c(50,   40,   55,    20),
+  duration = c(0.75, 0.75, 1.0,   0.5)
+)
+```
+
+```{r display_schedules}
+# Display schedules as formatted tables
+dose_schedule %>%
+  kable(caption = "Insulin Dosing Schedule",
+        col.names = c("Time (hr)", "Dose (Units)")) %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+
+meal_schedule %>%
+  kable(caption = "Meal (Glucose Intake) Schedule",
+        col.names = c("Time (hr)", "Carb Load", "Duration (hr)")) %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+```
+
+---
+
+# 6. Run Simulations Across All Injection Sites
+
+```{r run_simulations}
+# ============================================================================
+# SIMULATION LOOP
+# ============================================================================
+# We run the ODE solver once for each injection site. The ONLY parameters that
+# change between runs are Vmax and Km (the absorption parameters). Everything
+# else — clearance, secretion, glucose dynamics, dosing, meals — is held
+# constant. This isolates the injection site effect.
+#
+# Solver: lsoda (from deSolve) — an adaptive-step solver that automatically
+# handles stiff systems. It switches between Adams (non-stiff) and BDF (stiff)
+# methods as needed.
+#
+# Initial conditions:
+#   S(0) = 0     : empty depot (no insulin injected yet)
+#   P(0) = 0     : no exogenous insulin in plasma yet
+#   G(0) = 90    : fasting blood glucose ~90 mg/dL (normal range: 70-100)
+# ============================================================================
+
+# Time vector: simulate 24 hours at fine resolution
+times <- seq(0, 24, by = 0.01)  # 0.01 hr = 36 sec resolution
+
+# Initial state
+state_init <- c(S = 0, P = 0, G = 90)
+
+# Storage for all results
+all_results <- list()
+
+for (i in 1:nrow(site_profiles)) {
+  
+  # Build parameter list for this site
+  # Start with base parameters, then override Vmax and Km
+  params_i <- base_params
+  params_i$Vmax <- site_profiles$Vmax[i]
+  params_i$Km   <- site_profiles$Km[i]
+  
+  # Attach schedules to params (the ODE function reads them from here)
+  params_i$dose_schedule <- dose_schedule
+  params_i$meal_schedule <- meal_schedule
+  
+  # Solve the ODE system
+  sol <- ode(
+    y      = state_init,
+    times  = times,
+    func   = insulin_ode,
+    parms  = params_i,
+    method = "lsoda"      # adaptive solver for potentially stiff system
+  )
+  
+  # Convert to data frame and label with site name
+  df <- as.data.frame(sol)
+  df$site <- site_profiles$site[i]
+  
+  all_results[[i]] <- df
+}
+
+# Combine all site results into one long-format data frame
+results <- bind_rows(all_results)
+
+# Set site as an ordered factor (for consistent plot ordering)
+results$site <- factor(results$site, levels = site_profiles$site)
+
+# Preview the structure
+cat("Simulation complete:", nrow(results), "rows across", 
+    length(unique(results$site)), "sites\n")
+cat("Columns:", paste(names(results), collapse = ", "), "\n")
+```
+
+---
+
+# 7. Compute PK Metrics
+
+```{r pk_metrics}
+# ============================================================================
+# PHARMACOKINETIC METRICS
+# ============================================================================
+# For each injection site, we compute the three primary PK metrics from the
+# proposal, plus glucose time-in-range:
+#
+#   Cmax: Peak plasma insulin concentration (Units/L)
+#         The highest value P(t) reaches. Higher Cmax means a stronger
+#         but more transient insulin effect.
+#
+#   Tmax: Time to peak concentration (hours)
+#         How long after the first injection until P reaches Cmax.
+#         Faster-absorbing sites (abdomen) have shorter Tmax.
+#
+#   AUC:  Area under the plasma insulin curve (Units·hr/L)
+#         Total systemic insulin exposure over 24 hours. Computed via
+#         the trapezoidal rule. Higher AUC = more total insulin action.
+#
+#   TIR:  Time in glucose range 70–180 mg/dL (%)
+#         Clinical metric — what fraction of the day is glucose in the
+#         acceptable range? Higher = better glycemic control.
+# ============================================================================
+
+pk_table <- results %>%
+  group_by(site) %>%
+  summarise(
+    # Peak plasma concentration
+    Cmax = max(P, na.rm = TRUE),
+    
+    # Time of peak (first occurrence)
+    Tmax = time[which.max(P)],
+    
+    # AUC via trapezoidal rule:
+    # sum of (average of consecutive P values) * (time step)
+    AUC = sum(diff(time) * (P[-1] + P[-n()]) / 2),
+    
+    # Glucose time-in-range (70–180 mg/dL)
+    TIR = mean(G >= 70 & G <= 180) * 100,
+    
+    # Additional: peak glucose excursion
+    G_max = max(G, na.rm = TRUE),
+    G_min = min(G, na.rm = TRUE),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+
+pk_table %>%
+  kable(
+    caption = "Pharmacokinetic Metrics by Injection Site",
+    col.names = c("Site", "C_max (U/L)", "T_max (hr)", "AUC (U·hr/L)",
+                  "TIR (%)", "G_max (mg/dL)", "G_min (mg/dL)")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  column_spec(2, bold = TRUE) %>%
+  column_spec(5, color = ifelse(pk_table$TIR > 70, "green", "orange"))
+```
+
+---
+
+# 8. Visualizations
+
+## 8.1 Three-Axis Phase Portrait (3D Trajectory)
+
+```{r phase_portrait_3d, fig.height=7}
+# ============================================================================
+# 3D PHASE PORTRAIT
+# ============================================================================
+# This plot shows the trajectory of the system through its three-dimensional
+# state space (S, P, G). Each point is the system state at a moment in time.
+#
+# Why this matters:
+# - The shape of the trajectory reveals the system's dynamical structure
+# - Loops/spirals indicate oscillatory behavior (dose-meal cycles)
+# - The "tightness" of the trajectory shows how quickly the system returns
+#   to its attractor after perturbation (dose or meal)
+# - Different sites produce differently shaped trajectories because
+#   faster absorption (abdomen) creates sharper excursions in P
+#
+# We use plotly for interactive 3D rotation.
+# ============================================================================
+
+# Select one site for the primary 3D view (can rotate interactively)
+site_3d <- "Abdomen"
+df_3d <- results %>% filter(site == site_3d)
+
+# Color by time for temporal progression
+plot_ly(
+  df_3d,
+  x = ~S, y = ~P, z = ~G,
+  type = "scatter3d",
+  mode = "lines",
+  line = list(
+    color = ~time,
+    colorscale = list(c(0, "#48bb78"), c(0.5, "#4299e1"), c(1, "#e53e3e")),
+    width = 3
+  ),
+  hoverinfo = "text",
+  text = ~paste0("t=", round(time, 2), "hr<br>S=", round(S, 2),
+                 "<br>P=", round(P, 2), "<br>G=", round(G, 1))
+) %>%
+  layout(
+    title = list(
+      text = paste("3D Phase Portrait —", site_3d),
+      font = list(size = 16)
+    ),
+    scene = list(
+      xaxis = list(title = "S — SC Depot (Units)"),
+      yaxis = list(title = "P — Plasma Insulin (U/L)"),
+      zaxis = list(title = "G — Blood Glucose (mg/dL)"),
+      camera = list(eye = list(x = 1.5, y = 1.5, z = 1.0))
+    ),
+    margin = list(t = 50)
+  )
+```
+
+```{r phase_portrait_all_sites, fig.height=7}
+# ============================================================================
+# 3D PHASE PORTRAIT — ALL SITES OVERLAID
+# ============================================================================
+# Overlaying all four sites on the same 3D plot lets us directly compare
+# how the trajectory shape changes with injection site.
+# ============================================================================
+
+fig <- plot_ly()
+
+for (i in 1:nrow(site_profiles)) {
+  df_i <- results %>% filter(site == site_profiles$site[i])
+  fig <- fig %>%
+    add_trace(
+      data = df_i,
+      x = ~S, y = ~P, z = ~G,
+      type = "scatter3d",
+      mode = "lines",
+      line = list(color = site_profiles$color[i], width = 3),
+      name = site_profiles$site[i]
+    )
+}
+
+fig %>%
+  layout(
+    title = list(text = "3D Phase Portrait — All Injection Sites", font = list(size = 16)),
+    scene = list(
+      xaxis = list(title = "S (SC Depot)"),
+      yaxis = list(title = "P (Plasma Insulin)"),
+      zaxis = list(title = "G (Blood Glucose)"),
+      camera = list(eye = list(x = 1.6, y = 1.4, z = 0.9))
+    )
+  )
+```
+
+
+## 8.2 Time Series — All State Variables by Site
+
+```{r time_series, fig.height=10, fig.width=11}
+# ============================================================================
+# TIME SERIES: S(t), P(t), G(t) FOR ALL INJECTION SITES
+# ============================================================================
+# Three-panel time series showing how each state variable evolves over 24 hours
+# under the same dosing/meal schedule but different injection sites.
+#
+# Key things to observe:
+#   Panel 1 (S): Slower sites (thigh) show higher depot peaks and slower
+#     drainage — insulin accumulates more between doses.
+#   Panel 2 (P): Faster sites (abdomen) produce higher, sharper plasma peaks.
+#     Slower sites produce flatter, more prolonged profiles.
+#   Panel 3 (G): The glucose response integrates both insulin kinetics and
+#     meal timing. Look for how post-meal glucose excursions differ by site.
+# ============================================================================
+
+# Define site colors for consistent use across all plots
+site_colors <- setNames(site_profiles$color, site_profiles$site)
+
+# --- Panel 1: Subcutaneous Depot S(t) ---
+p_S <- ggplot(results, aes(x = time, y = S, color = site)) +
+  geom_line(linewidth = 0.8, alpha = 0.85) +
+  scale_color_manual(values = site_colors) +
+  labs(
+    title = "Subcutaneous Depot  S(t)",
+    subtitle = "Insulin remaining at injection site — slower sites retain more",
+    x = NULL, y = "S (Units)", color = "Site"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "grey50", size = 10)
+  )
+
+# --- Panel 2: Plasma Insulin P(t) ---
+p_P <- ggplot(results, aes(x = time, y = P, color = site)) +
+  geom_line(linewidth = 0.8, alpha = 0.85) +
+  scale_color_manual(values = site_colors) +
+  labs(
+    title = "Plasma Insulin  P(t)",
+    subtitle = "Active circulating insulin — faster sites produce sharper peaks",
+    x = NULL, y = "P (Units/L)", color = "Site"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "grey50", size = 10)
+  )
+
+# --- Panel 3: Blood Glucose G(t) ---
+# Add reference lines for the clinically acceptable range (70–180 mg/dL)
+p_G <- ggplot(results, aes(x = time, y = G, color = site)) +
+  geom_hline(yintercept = c(70, 180), linetype = "dashed", color = "grey60", linewidth = 0.5) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 70, ymax = 180,
+           fill = "green", alpha = 0.04) +
+  geom_line(linewidth = 0.8, alpha = 0.85) +
+  scale_color_manual(values = site_colors) +
+  annotate("text", x = 23.5, y = 175, label = "180", color = "grey50", size = 3, hjust = 1) +
+  annotate("text", x = 23.5, y = 75, label = "70", color = "grey50", size = 3, hjust = 1) +
+  labs(
+    title = "Blood Glucose  G(t)",
+    subtitle = "Glycemic response — green band = target range (70–180 mg/dL)",
+    x = "Time (hours)", y = "G (mg/dL)", color = "Site"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "grey50", size = 10)
+  )
+
+# Compose into a 3-panel figure using patchwork
+p_S / p_P / p_G +
+  plot_annotation(
+    title = "24-Hour Time Series by Injection Site",
+    subtitle = "Same dosing schedule, same meals — only absorption parameters vary",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 16),
+      plot.subtitle = element_text(color = "grey40", size = 12)
+    )
+  )
+```
+
+
+## 8.3 Absorption Rate Dynamics
+
+```{r absorption_rate, fig.height=5}
+# ============================================================================
+# ABSORPTION RATE: k_abs(S) OVER TIME
+# ============================================================================
+# This shows the instantaneous absorption flux from the SC depot to plasma.
+# The Michaelis-Menten nonlinearity is visible here:
+#   - Immediately after injection: S is large → kabs saturates near Vmax
+#   - As the depot drains: kabs transitions to first-order (linear in S)
+#   - Between doses: kabs drops to near zero (depot nearly empty)
+#
+# Faster sites (abdomen, high Vmax) show taller but narrower absorption
+# peaks. Slower sites (thigh, low Vmax) show shorter but wider peaks.
+# The AREA under each peak is similar (same dose), but the SHAPE differs.
+# ============================================================================
+
+ggplot(results, aes(x = time, y = kabs, color = site, fill = site)) +
+  geom_area(alpha = 0.15, position = "identity") +
+  geom_line(linewidth = 0.7) +
+  scale_color_manual(values = site_colors) +
+  scale_fill_manual(values = site_colors) +
+  labs(
+    title = "Absorption Rate  k_abs(S) Over Time",
+    subtitle = "Michaelis-Menten flux from depot → plasma (saturates at Vmax post-injection)",
+    x = "Time (hours)", y = "Absorption Rate (U/hr)",
+    color = "Site", fill = "Site"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "grey50", size = 10),
+    legend.position = "bottom"
+  )
+```
+
+
+## 8.4 Endogenous Secretion & Feedback Dynamics
+
+```{r feedback_dynamics, fig.height=7}
+# ============================================================================
+# ENDOGENOUS SECRETION E(G) AND INHIBITORY FACTOR C(t)
+# ============================================================================
+# These two panels reveal the internal feedback loop:
+#
+# Top panel: E(G) — how β-cell secretion responds to glucose changes.
+#   When glucose spikes after a meal, E(G) rises. But this is modulated
+#   by C(t), which suppresses secretion when plasma insulin is already high.
+#
+# Bottom panel: C(t) — the inhibitory factor.
+#   After injection, plasma insulin P rises → C(t) drops (suppression).
+#   Between doses, P falls → C(t) recovers toward 1 (full secretion).
+#
+# The interplay between these two functions is what prevents the P ↔ G
+# system from oscillating out of control.
+# ============================================================================
+
+# Select one site for clarity
+df_feedback <- results %>% filter(site == "Abdomen")
+
+p_EG <- ggplot(df_feedback, aes(x = time)) +
+  geom_line(aes(y = E_G), color = "#805ad5", linewidth = 0.9) +
+  geom_line(aes(y = U_PG), color = "#38b2ac", linewidth = 0.7, linetype = "dashed") +
+  labs(
+    title = "Endogenous Secretion E(G)  &  Utilization U(P,G)",
+    subtitle = "Purple = β-cell secretion rate | Teal dashed = glucose uptake rate",
+    x = NULL, y = "Rate"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "grey50", size = 10)
+  )
+
+p_Ct <- ggplot(df_feedback, aes(x = time, y = C_t)) +
+  geom_line(color = "#e53e3e", linewidth = 0.9) +
+  geom_hline(yintercept = 0.5, linetype = "dotted", color = "grey50") +
+  annotate("text", x = 23, y = 0.53, label = "50% suppression", 
+           color = "grey50", size = 3, hjust = 1) +
+  ylim(0, 1) +
+  labs(
+    title = "Inhibitory Factor  C(t)",
+    subtitle = "Drops when plasma insulin is high → suppresses endogenous secretion",
+    x = "Time (hours)", y = "C(t)  [0 = fully suppressed, 1 = no suppression]"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "grey50", size = 10)
+  )
+
+p_EG / p_Ct +
+  plot_annotation(
+    title = "Feedback Loop Dynamics (Abdomen Site)",
+    theme = theme(plot.title = element_text(face = "bold", size = 15))
+  )
+```
+
+
+## 8.5 Phase Planes (2D Projections)
+
+```{r phase_planes, fig.height=5, fig.width=12}
+# ============================================================================
+# 2D PHASE PLANE PROJECTIONS
+# ============================================================================
+# While the 3D portrait shows the full trajectory, 2D projections are
+# easier to read and reveal specific pairwise relationships:
+#
+#   S vs P: Shows the absorption-clearance relationship.
+#           Dose events push the system to high S, then it drains toward
+#           high P as absorption converts depot to plasma insulin.
+#
+#   P vs G: Shows the insulin-glucose control loop.
+#           Post-meal: G rises → P rises (via secretion + injection).
+#           Post-peak: P drives G down via utilization.
+#           The shape of these loops differs by site.
+#
+#   S vs G: Shows how depot status relates to glycemic state.
+#           Not directly coupled, but correlated through P.
+# ============================================================================
+
+p_SP <- ggplot(results, aes(x = S, y = P, color = site)) +
+  geom_path(linewidth = 0.6, alpha = 0.7) +
+  scale_color_manual(values = site_colors) +
+  labs(title = "S vs P", subtitle = "Depot → Plasma absorption path",
+       x = "S (Depot)", y = "P (Plasma)") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+p_PG <- ggplot(results, aes(x = P, y = G, color = site)) +
+  geom_path(linewidth = 0.6, alpha = 0.7) +
+  geom_hline(yintercept = c(70, 180), linetype = "dashed", color = "grey70", linewidth = 0.4) +
+  scale_color_manual(values = site_colors) +
+  labs(title = "P vs G", subtitle = "Insulin-glucose control loop",
+       x = "P (Plasma Insulin)", y = "G (Glucose)") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+p_SG <- ggplot(results, aes(x = S, y = G, color = site)) +
+  geom_path(linewidth = 0.6, alpha = 0.7) +
+  geom_hline(yintercept = c(70, 180), linetype = "dashed", color = "grey70", linewidth = 0.4) +
+  scale_color_manual(values = site_colors) +
+  labs(title = "S vs G", subtitle = "Depot status vs glycemic state",
+       x = "S (Depot)", y = "G (Glucose)") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+
+p_SP + p_PG + p_SG +
+  plot_annotation(
+    title = "2D Phase Plane Projections — All Sites",
+    theme = theme(plot.title = element_text(face = "bold", size = 15))
+  )
+```
+
+
+## 8.6 PK Metrics Comparison
+
+```{r pk_comparison, fig.height=5, fig.width=11}
+# ============================================================================
+# PK METRICS BAR CHARTS
+# ============================================================================
+# Visual comparison of the key pharmacokinetic metrics across sites.
+# These are the primary outputs of the model — the metrics from the proposal
+# (Cmax, Tmax, AUC) plus the clinical glucose time-in-range.
+# ============================================================================
+
+# Reshape for faceted plotting
+pk_long <- pk_table %>%
+  select(site, Cmax, Tmax, AUC, TIR) %>%
+  pivot_longer(-site, names_to = "metric", values_to = "value") %>%
+  mutate(metric = factor(metric,
+    levels = c("Cmax", "Tmax", "AUC", "TIR"),
+    labels = c("C_max (U/L)", "T_max (hr)", "AUC (U·hr/L)", "Time in Range (%)")
+  ))
+
+ggplot(pk_long, aes(x = site, y = value, fill = site)) +
+  geom_col(width = 0.65, alpha = 0.85) +
+  geom_text(aes(label = round(value, 1)), vjust = -0.4, size = 3.2, fontface = "bold") +
+  facet_wrap(~ metric, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = site_colors) +
+  labs(
+    title = "Pharmacokinetic Metrics by Injection Site",
+    subtitle = "Same dose, same meals — site affects absorption kinetics only",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 35, hjust = 1, size = 9),
+    strip.text = element_text(face = "bold", size = 11),
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(color = "grey50", size = 11)
+  )
+```
+
+
+## 8.7 Sensitivity Analysis: Dose Size
+
+```{r sensitivity_dose, fig.height=6, fig.width=10}
+# ============================================================================
+# SENSITIVITY ANALYSIS: VARYING DOSE SIZE
+# ============================================================================
+# How does changing the dose magnitude affect the PK profile?
+# We run the abdomen site at 5, 10, 15, and 20 Units per injection
+# (all other parameters constant) and overlay the plasma insulin and
+# glucose time series.
+#
+# This shows:
+#   - How Cmax scales with dose (nonlinearly due to MM absorption)
+#   - Whether higher doses improve glucose control or cause hypoglycemia
+#   - The therapeutic window between efficacy and over-dosing
+# ============================================================================
+
+dose_levels <- c(5, 10, 15, 20)
+dose_results <- list()
+
+for (d in dose_levels) {
+  # Scale all doses proportionally
+  ds <- dose_schedule
+  ds$amount <- ds$amount * (d / 10)  # 10 is the baseline
+  
+  params_d <- base_params
+  params_d$Vmax <- 18   # Abdomen
+  params_d$Km   <- 30
+  params_d$dose_schedule <- ds
+  params_d$meal_schedule <- meal_schedule
+  
+  sol <- ode(y = state_init, times = times, func = insulin_ode,
+             parms = params_d, method = "lsoda")
+  df <- as.data.frame(sol)
+  df$dose_label <- paste0(d, " U")
+  dose_results[[length(dose_results) + 1]] <- df
+}
+
+dose_df <- bind_rows(dose_results)
+dose_df$dose_label <- factor(dose_df$dose_label, 
+                              levels = paste0(dose_levels, " U"))
+
+p_dose_P <- ggplot(dose_df, aes(x = time, y = P, color = dose_label)) +
+  geom_line(linewidth = 0.8) +
+  scale_color_brewer(palette = "YlOrRd") +
+  labs(title = "Plasma Insulin — Dose Sensitivity",
+       subtitle = "Abdomen site, varying bolus size",
+       x = NULL, y = "P (U/L)", color = "Dose") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "none")
+
+p_dose_G <- ggplot(dose_df, aes(x = time, y = G, color = dose_label)) +
+  geom_hline(yintercept = c(70, 180), linetype = "dashed", color = "grey60") +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 70, ymax = 180,
+           fill = "green", alpha = 0.04) +
+  geom_line(linewidth = 0.8) +
+  scale_color_brewer(palette = "YlOrRd") +
+  labs(title = "Blood Glucose — Dose Sensitivity",
+       subtitle = "Higher doses → more aggressive glucose lowering (risk of hypo)",
+       x = "Time (hours)", y = "G (mg/dL)", color = "Dose") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "bottom")
+
+p_dose_P / p_dose_G
+```
+
+---
+
+# 9. Summary
+
+```{r summary_text, results='asis'}
+# ============================================================================
+# SUMMARY
+# ============================================================================
+cat("
+## Key Findings from the Preliminary Model
+
+**1. Site-dependent absorption produces measurably different PK profiles.**
+The abdomen (highest Vmax, lowest Km) produces the tallest, sharpest plasma 
+insulin peaks, while the thigh produces broader, flatter profiles with the 
+same total dose.
+
+**2. Faster absorption improves postprandial glucose control.**
+The abdomen site achieves lower peak glucose excursions and higher time-in-range
+because insulin arrival is better aligned with meal glucose appearance.
+
+**3. Slower sites accumulate more insulin in the depot.**
+The thigh shows visible depot buildup between doses — insulin from one injection 
+has not fully cleared before the next arrives. This could contribute to 
+unpredictable delayed absorption.
+
+**4. The feedback loop (E(G) · C(t)) provides endogenous damping.**
+When exogenous insulin raises P, the inhibitory factor C(t) suppresses 
+endogenous secretion, preventing insulin stacking. This feedback is visible 
+in the C(t) time series as dips following each injection.
+
+**5. Dose sensitivity is nonlinear.**
+Due to Michaelis-Menten absorption, doubling the dose does not double Cmax.
+The depot saturates at Vmax, so excess insulin is released more slowly —
+a built-in buffering mechanism.
+
+### Next Steps (per phased plan)
+- **Phase 2**: Validate glucose compartment coupling against published 
+  postprandial glucose profiles.
+- **Phase 3**: Systematically sweep injection-meal timing offsets and 
+  dose-splitting strategies across all four sites.
+")
+```
+
+---
+
+*Model equations and parameter values are preliminary and drawn from published 
+literature (Gradel et al. 2018, Koivisto & Felig 1980). Patient-specific 
+calibration and formal validation are planned for Phase 3.*

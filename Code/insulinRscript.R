@@ -29,22 +29,22 @@ base_params <- list(
   
   IC50 = 10,    # half saturation term for glucose secretion inhibition
   
-  Gb = 0.3,     # Basal glucose production
-  k0 = 0.02,    # Basal glucose uptake
+  Gb = 0.5,     # Basal glucose production
+  k0 = 0.01,    # Basal glucose uptake
   Umax = 6,     # Maximal glucose uptake
-  KP = 30,      # Half saturation for insulin in utilization
+  KP = 15,      # Half saturation for insulin in utilization
   KG = 40,       # Half saturation for glucose in utilization
   
   # Circadian rhythm stuff
   m = 0.02,      # slope for linear decrease
   wake=6,         # wake for linear decrease
-  depth=0.35,     # stuff for dawn effect
+  depth=0.25,     # stuff for dawn effect
   mu=6,
-  sigma=1.5,
+  sigma=2,
   
   # Hepatic buffering
   G_set = 102,      # setpoint
-  kH = .4      # buffering strength
+  kH = .2      # buffering strength
 )
 
 # Exogenous Input parameters (Glucose + Insulin)

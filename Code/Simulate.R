@@ -7,8 +7,8 @@ source(file.path(this_dir, "insulinRscript.R"))
 # Site Profiles
 site_profiles <- data.frame(
   site  = c("Abdomen", "Upper Arm", "Buttock", "Thigh"),
-  Vmax  = c(18, 10, 2, 5),
-  Km    = c(30, 50, 60, 90),
+  Vmax  = c(18, 13, 10, 8),
+  Km    = c(30, 40, 42, 50),
   color = c("#c53030", "#d69e2e", "#2b6cb0", "#718096"),
   stringsAsFactors = FALSE
 )

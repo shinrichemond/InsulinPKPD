@@ -29,7 +29,7 @@ base_params <- list(
   IC50 = 25,    # half saturation term for glucose secretion inhibition
   
   Gb = 0.3,     # Basal glucose production
-  Umax = 8.0,   # Maximal glucose uptake
+  Umax = 9,     # Maximal glucose uptake
   KP = 10,      # Half saturation for insulin in utilization
   KG = 80       # Half saturation for glucose in utilization
 )
@@ -51,6 +51,19 @@ meal_durs   <- c(1.0, 1.0, 1.0)    # absorption windows
 dose_times  <- c(7.75, 12.75, 18.75)  # pre-meal injections
 dose_sizes  <- c(7, 8, 7)
 inj_dur <- 0.05   # 3 min
+
+# Insulin Sensitivity functions
+sens_linear <- function(t_day, wake=6, sleep=22, m=0.02){ # sensitivity decline
+  if(t_day < wake) return(1 - m*(sleep-wake))  # night baseline
+  if(t_day > sleep) return(1 - m*(sleep-wake))
+  
+  x <- t_day - wake
+  y <- 1 - m*x   # y = -m x + 1
+  max(y, 0.5)    # physiological floor (avoid zero sensitivity)
+}
+sens_dawn <- function(t_day, mu=6, sigma=1.5, depth=0.35){ # dawn phenomenon
+  1 - depth * exp(-((t_day - mu)^2)/(2*sigma^2))
+}
 
 # Main System ODE
 insulin_ode <- function(t, state, params) {
@@ -90,15 +103,16 @@ insulin_ode <- function(t, state, params) {
     G_pos <- max(G, 0)
     
     # Auxiliary Functions
-    kabs <- Vmax * S_pos / (Km + S_pos)                                # Insulin Absorption
-    E_G   <- Emax * G_pos^hillN   / (EC50^hillN + G_pos^hillN )        # Endogenous glucose production
-    C_t <- 1 / (1 + P_pos / IC50)                                      # glucose production inhibitory term
-    U_PG <- Umax * P_pos * G_pos / ((KP + P_pos) * (KG + G_pos))       # glucose utilization 
+    kabs <- Vmax * S_pos / (Km + S_pos)                           # Insulin Absorption
+    E_G   <- Emax * G_pos^hillN   / (EC50^hillN + G_pos^hillN )   # Endogenous glucose production
+    C_t <- 1 / (1 + P_pos / IC50)                                 # glucose production inhibitory term
+    sens <- sens_linear(t_day) * sens_dawn(t_day)                 # time-dependent insulin sensitivity
+    U_PG <- Umax * P_pos * G_pos / ((KP + P_pos) * (KG + G_pos))  # glucose utilization 
     
     # Main ODEs
     dS <- u_input - kabs - kdeg * S_pos + kre * P_pos
     dP <- Vc * (kabs + E_G * C_t + I_basal) - kclr * P_pos - kenz * P_pos - kre * P_pos
-    dG <- Gb + G_in - U_PG
+    dG <- Gb + G_in - sens * U_PG
     
     # Return
     return(list(
@@ -122,7 +136,7 @@ state0 <- c(
 
 # Time God
 day_length <- 24
-end_day <- 31
+end_day <- 14
 t_end <- day_length * end_day     # run for however many days
 dt    <- 1/60                     # set time resolution
 times <- seq(0, t_end, by = dt)
@@ -143,6 +157,82 @@ out <- ode(
 
 out_df <- as.data.frame(out)
 
+# Graphs
 ggplot(out_df, aes(x = time/24, y = G)) +
   geom_line() +
+  theme_minimal()
+
+ggplot(out_df, aes(x = time/24, y = G)) +
+  geom_line() +
+  geom_hline(yintercept = c(70, 100), linetype="dashed") +
+  labs(title="Fasting glucose range (70–100 mg/dL)") +
+  theme_minimal()
+
+ggplot(out_df, aes(x = time/24, y = G)) +
+  geom_line() +
+  geom_hline(yintercept = c(120,160), linetype="dotted") +
+  labs(title="Post-prandial glucose excursion window") +
+  theme_minimal()
+
+ggplot(out_df, aes(x = time/24, y = P)) +
+  geom_line() +
+  labs(title="Plasma insulin concentration dynamics") +
+  theme_minimal()
+
+ggplot(out_df, aes(x = time/24, y = S)) +
+  geom_line() +
+  labs(title="Subcutaneous insulin depot") +
+  theme_minimal()
+sens_df <- data.frame(
+  time = out_df$time,
+  t_day = out_df$time %% 24,
+  sens = sapply(out_df$time %% 24, function(td){
+    sens_linear(td) * sens_dawn(td)
+  })
+)
+
+sens_df <- data.frame(
+  time = out_df$time,
+  t_day = out_df$time %% 24,
+  sens = sapply(out_df$time %% 24, function(td){
+    sens_linear(td) * sens_dawn(td)
+  })
+)
+ggplot(sens_df, aes(x = time/24, y = sens)) +
+  geom_line() +
+  labs(title="Time-varying insulin sensitivity") +
+  theme_minimal()
+
+out_df$U_eff <- with(out_df,
+                     sapply(time %% 24, function(td){
+                       sens_linear(td) * sens_dawn(td)
+                     }) * base_params$Umax * P * G / ((base_params$KP + P)*(base_params$KG + G))
+)
+ggplot(out_df, aes(x = time/24, y = U_eff)) +
+  geom_line() +
+  labs(title="Effective glucose utilization") +
+  theme_minimal()
+
+out_df$E_prod <- with(out_df, base_params$Emax * G^base_params$hillN / (base_params$EC50^base_params$hillN + G^base_params$hillN))
+ggplot(out_df, aes(x = time/24, y = E_prod)) +
+  geom_line() +
+  labs(title="Endogenous glucose production") +
+  theme_minimal()
+
+out_df$net_G <- with(out_df, base_params$Gb + G_in - U_eff)
+ggplot(out_df, aes(x = time/24, y = net_G)) +
+  geom_line() +
+  geom_hline(yintercept = 0, linetype="dashed") +
+  labs(title="Glucose mass balance") +
+  theme_minimal()
+
+ggplot(out_df, aes(x = P, y = G)) +
+  geom_path(alpha=0.5) +
+  labs(title="Phase plane: Plasma insulin vs Glucose") +
+  theme_minimal()
+
+ggplot(out_df, aes(x = time/24, y = G)) +
+  geom_line() +
+  geom_hline(yintercept = c(70,140), linetype="dashed") +
+  labs(title="Glucose time-in-range (70–140)") +
   theme_minimal()

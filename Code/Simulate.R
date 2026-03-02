@@ -7,8 +7,8 @@ source(file.path(this_dir, "insulinRscript.R"))
 # Site Profiles
 site_profiles <- data.frame(
   site  = c("Abdomen", "Upper Arm", "Buttock", "Thigh"),
-  Vmax  = c(18, 13, 10, 8),
-  Km    = c(30, 40, 42, 50),
+  Vmax  = c(18, 10, 2, 5),
+  Km    = c(30, 50, 60, 90),
   color = c("#c53030", "#d69e2e", "#2b6cb0", "#718096"),
   stringsAsFactors = FALSE
 )
@@ -33,20 +33,11 @@ params <- c(
   list(day_length = day_length)
 )
 
-# Run ODE
-out <- ode(
-  y     = state0,
-  times = times,
-  func  = insulin_ode,
-  parms = params,
-  method = "lsoda"
-)
-
 # Storage
 results <- lapply(1:nrow(site_profiles), function(i){
   
   site <- site_profiles$site[i]
-  params_site <- c(
+  params_site <- modifyList(
     base_params,
     list(
       Vmax = site_profiles$Vmax[i],

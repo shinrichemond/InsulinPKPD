@@ -142,7 +142,7 @@ glucose_hist <- ggplot(out_df, aes(x = G, fill = site)) +
 glucose_hist
 
 # -----------------------------
-# 5. Depot vs Plasma Insulin Scatter / kabs overlay
+# Depot vs Plasma Insulin Scatter / kabs overlay
 depot_scatter <- ggplot(out_df, aes(x = S, y = P, color = site)) +
   geom_path(size = 0.7, alpha=0.8) +
   geom_line(aes(y = kabs), linetype="dashed") +

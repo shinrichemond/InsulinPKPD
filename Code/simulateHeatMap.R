@@ -2,7 +2,7 @@ library(deSolve)
 library(dplyr)
 library(ggplot2)
 library(patchwork)
-
+library(shadowtext)
 
 # get system ODE
 this_dir <- dirname(rstudioapi::getActiveDocumentContext()$path)
@@ -20,8 +20,8 @@ state_init <- c(
 )
 
 # Parameter ranges
-Vmax_vals <- seq(8, 30, length.out = 12)
-Km_vals   <- seq(10, 80, length.out = 12)
+Vmax_vals <- seq(5, 20)
+Km_vals   <- seq(25, 55, length.out = length(Vmax_vals))
 
 results <- data.frame()
 
@@ -65,6 +65,16 @@ for (v in Vmax_vals) {
 
 
 # Plots (stolen from aditya)
+# site parameters:
+site_params <- data.frame(
+  site  = c("Abdomen", "Upper Arm", "Buttock", "Thigh"),
+  Vmax  = c(18, 13, 10, 8),
+  Km    = c(30, 40, 42, 50),
+  color = c("#c53030", "#d69e2e", "#2b6cb0", "#718096"),
+  stringsAsFactors = FALSE
+)
+
+
 heatmap_theme <- theme_minimal(base_size = 12) +
   theme(
     plot.title    = element_text(face = "bold", size = 14),
@@ -82,7 +92,24 @@ p_cmax <- ggplot(results, aes(x = Vmax, y = Km, fill = Cmax)) +
     x = "Vmax (Absorption Capacity)",
     y = "Km (Diffusion Resistance)"
   ) +
-  heatmap_theme
+  heatmap_theme + geom_point(
+    data = site_params,
+    aes(x = Vmax, y = Km),
+    inherit.aes = FALSE,
+    size = 3,
+    shape = 24,
+    fill = "black",
+    color = "white",
+    stroke = 1.2
+  ) + shadowtext::geom_shadowtext(
+    data = site_params,
+    aes(x = Vmax, y = Km, label = site),
+    inherit.aes = FALSE,
+    size = 3.5,
+    vjust = 1.5,
+    bg.colour = "black",
+    bg.r = 0.1
+  )
 
 p_cmax
 
@@ -96,7 +123,24 @@ p_tmax <- ggplot(results, aes(x = Vmax, y = Km, fill = Tmax)) +
     x = "Vmax",
     y = "Km"
   ) +
-  heatmap_theme
+  heatmap_theme + geom_point(
+    data = site_params,
+    aes(x = Vmax, y = Km),
+    inherit.aes = FALSE,
+    size = 3,
+    shape = 24,
+    fill = "black",
+    color = "white",
+    stroke = 1.2
+  ) + shadowtext::geom_shadowtext(
+    data = site_params,
+    aes(x = Vmax, y = Km, label = site),
+    inherit.aes = FALSE,
+    size = 3.5,
+    vjust = 1.5,
+    bg.colour = "black",
+    bg.r = 0.1
+  )
 
 p_tmax
 
@@ -110,9 +154,26 @@ p_auc <- ggplot(results, aes(x = Vmax, y = Km, fill = AUC)) +
     x = "Vmax",
     y = "Km"
   ) +
-  heatmap_theme
+  heatmap_theme + geom_point(
+    data = site_params,
+    aes(x = Vmax, y = Km),
+    inherit.aes = FALSE,
+    size = 3,
+    shape = 24,
+    fill = "black",
+    color = "white",
+    stroke = 1.2
+  ) + shadowtext::geom_shadowtext(
+    data = site_params,
+    aes(x = Vmax, y = Km, label = site),
+    inherit.aes = FALSE,
+    size = 3.5,
+    vjust = 1.5,
+    bg.colour = "black",
+    bg.r = 0.1
+  )
 
 p_auc
 
 # Plot all
-p_cmax / p_tmax / p_auc
+p_cmax | p_tmax | p_auc

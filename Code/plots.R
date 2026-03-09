@@ -101,17 +101,17 @@ insulin_metrics <- out_df %>%
 
 cmax_plot <- ggplot(insulin_metrics %>% filter(Metric=="Cmax"), 
                     aes(x = site, y = Value, fill = site)) +
-  geom_col() + labs(title="Cmax by Site", y="Peak Plasma Insulin") + theme_minimal()
+  geom_col() + labs(title="Cmax by Site", y="Peak Plasma Insulin") + theme_minimal() + theme(axis.title.x = element_blank())
 
 tmax_plot <- ggplot(insulin_metrics %>% filter(Metric=="Tmax"), 
                     aes(x = site, y = Value, fill = site)) +
-  geom_col() + labs(title="Tmax by Site", y="Time to Peak (hours)") + theme_minimal()
+  geom_col() + labs(title="Tmax by Site", y="Time to Peak (hours)") + theme_minimal() + theme(axis.title.x = element_blank())
 
 auc_plot <- ggplot(insulin_metrics %>% filter(Metric=="AUC"), 
                    aes(x = site, y = Value, fill = site)) +
-  geom_col() + labs(title="AUC by Site", y="Total Exposure") + theme_minimal()
+  geom_col() + labs(title="AUC by Site", y="Total Exposure") + theme_minimal() + theme(axis.title.x = element_blank())
 
-metrics_plot <- cmax_plot / tmax_plot / auc_plot
+metrics_plot <- cmax_plot | tmax_plot | auc_plot
 metrics_plot
 
 # -----------------------------

@@ -20,35 +20,29 @@ out_df <- readRDS(file.path(this_dir, "data.rds"))
 site_colors <- setNames(site_profiles$color, site_profiles$site)
 
 p_S <- ggplot(out_df, aes(x = time, y = S, color = site)) +
-  geom_line(linewidth = 0.8, alpha = 0.85) +
+  geom_line(linewidth = 0.5, alpha = 0.85) +
   scale_color_manual(values = site_colors) +
-  labs(title="Subcutaneous Depot S(t)", y="S", color="Site") +
-  theme_minimal()
+  labs(title="Subcutaneous Depot S(t)", y="S", x="Time (hours)", color="Site: ") +
+  theme_minimal() + theme(legend.position = "none")
 
 p_P <- ggplot(out_df, aes(x = time, y = P, color = site)) +
-  geom_line(linewidth = 0.8, alpha = 0.85) +
+  geom_line(linewidth = 0.5, alpha = 0.85) +
   scale_color_manual(values = site_colors) +
-  labs(title="Plasma Insulin P(t)", y="P", color="Site") +
-  theme_minimal()
+  labs(title="Plasma Insulin P(t)", y="P", x="Time (hours)", color="Injection Site:") +
+  theme_minimal() + theme(legend.position = "bottom")
 
 p_G <- ggplot(out_df, aes(x = time, y = G, color = site)) +
   geom_hline(yintercept=c(70,180), linetype="dashed", color="grey60") +
   annotate("rect", xmin=-Inf, xmax=Inf, ymin=70, ymax=180,
            fill="green", alpha=0.04) +
-  geom_line(linewidth = 0.8, alpha = 0.85) +
+  geom_line(linewidth = 0.5, alpha = 0.85) +
   scale_color_manual(values = site_colors) +
-  labs(title="Blood Glucose G(t)", y="G", x="Time (hours)", color="Site") +
-  theme_minimal()
+  labs(title="Blood Glucose G(t)", y="G", x="Time (hours)", color="Site: ") +
+  theme_minimal() + theme(legend.position = "none")
 
-p_S / p_P / p_G +
-  plot_annotation(
-    title = "24-Hour Dynamics by Injection Site",
-    subtitle = "Same meals, same dosing — only absorption kinetics vary",
-    theme = theme(
-      plot.title = element_text(face = "bold", size = 16),
-      plot.subtitle = element_text(color = "grey40", size = 12)
-    )
-  )
+# Combine plots with a shared legend
+p_S | p_P | p_G 
+#ggsave("../Images/24HourGraph.png", plot = p_S | p_P | p_G, width = 9, height = 3)
 
 # =====================
 # Glucose Drift Check
@@ -80,39 +74,76 @@ p_drift
 
 # -----------------------------
 # Phase Plane: G vs P
-phase_plane <- ggplot(out_df, aes(x = P, y = G, color = site)) +
-  geom_path(linewidth = 0.8, alpha = 0.8) +
+out_df_stable <- out_df %>%
+  slice(-(1:96))
+phase_plane <- ggplot(out_df_stable, aes(x = P, y = G, color = site)) +
+  geom_path(linewidth = 0.4, alpha = 0.8) +
   labs(title = "Phase Plane: Glucose vs Plasma Insulin",
-       x = "Plasma Insulin (P)", y = "Glucose (G, mg/dL)") +
-  theme_minimal() +
+       x = "Plasma Insulin (P)", y = "Glucose (G, mg/dL)", color="Injection Site:") +
+  theme_minimal() + theme(legend.position = "bottom") +
   scale_color_brewer(palette = "Set1")
 phase_plane
 
+#ggsave("../Images/phaseplane.png", plot = phase_plane, width = 6, height = 5)
+
+
 # -----------------------------
 # Cmax / Tmax / AUC per site
-insulin_metrics <- out_df %>%
-  group_by(site) %>%
-  summarise(
-    Cmax = max(P),
-    Tmax = time[which.max(P)],
-    AUC  = sum(P) * (diff(time)[1]) # approximate integral via sum*dt
-  ) %>%
-  pivot_longer(cols = c(Cmax, Tmax, AUC), names_to = "Metric", values_to = "Value")
+last_dose <- max(dose_times)
+
+compute_last_peak <- function(df, last_dose, window = 4) {
+  
+  dt <- diff(df$time)[1]
+  
+  df %>%
+    group_by(site) %>%
+    group_modify(~{
+      df_window <- .x %>%
+        filter(time >= last_dose & time <= last_dose + window)
+      
+      if (nrow(df_window) == 0) return(data.frame())
+      
+      idx_max <- which.max(df_window$P)
+      
+      data.frame(
+        Cmax = df_window$P[idx_max],
+        Tmax = df_window$time[idx_max] - last_dose,  # relative
+        AUC  = sum(df_window$P) * dt
+      )
+    }) %>%
+    ungroup() %>%
+    pivot_longer(cols = c(Cmax, Tmax, AUC),
+                 names_to = "Metric",
+                 values_to = "Value")
+}
+
+insulin_metrics <- compute_last_peak(out_df, last_dose, window = 4)
 
 cmax_plot <- ggplot(insulin_metrics %>% filter(Metric=="Cmax"), 
                     aes(x = site, y = Value, fill = site)) +
-  geom_col() + labs(title="Cmax by Site", y="Peak Plasma Insulin") + theme_minimal() + theme(axis.title.x = element_blank())
+  geom_col() +
+  labs(title="Cmax", y="Peak Plasma Insulin") +
+  theme_minimal() + theme(legend.position = "none") +
+  theme(axis.title.x = element_blank())
 
 tmax_plot <- ggplot(insulin_metrics %>% filter(Metric=="Tmax"), 
                     aes(x = site, y = Value, fill = site)) +
-  geom_col() + labs(title="Tmax by Site", y="Time to Peak (hours)") + theme_minimal() + theme(axis.title.x = element_blank())
+  geom_col() +
+  labs(title="Tmax", y="Time to Peak (hours post-injection)", fill = "Injection Site: ") +
+  theme_minimal() + theme(legend.position = "bottom") +
+  theme(axis.title.x = element_blank())
 
 auc_plot <- ggplot(insulin_metrics %>% filter(Metric=="AUC"), 
                    aes(x = site, y = Value, fill = site)) +
-  geom_col() + labs(title="AUC by Site", y="Total Exposure") + theme_minimal() + theme(axis.title.x = element_blank())
+  geom_col() +
+  labs(title="AUC", y="Total Exposure") +
+  theme_minimal() + theme(legend.position = "none") +
+  theme(axis.title.x = element_blank())
 
 metrics_plot <- cmax_plot | tmax_plot | auc_plot
 metrics_plot
+
+#ggsave("../Images/barplot.png", plot = metrics_plot, width = 9, height = 5)
 
 # -----------------------------
 # Glucose Time-in-Range Heatmap

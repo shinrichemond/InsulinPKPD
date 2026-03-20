@@ -22,7 +22,7 @@ state0 <- c(
 
 # Time God
 day_length <- 24
-end_day <- 1
+end_day <- 31
 t_end <- day_length * end_day     # run for however many days
 dt    <- 1/60                     # set time resolution
 times <- seq(0, t_end, by = dt)

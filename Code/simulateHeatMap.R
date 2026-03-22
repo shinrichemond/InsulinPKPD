@@ -217,3 +217,4 @@ p_auc
 # Plot all
 p_cmax | p_tmax | p_auc
 
+#ggsave("../Images/heatmap.png", plot = p_cmax | p_tmax | p_auc, width = 12, height = 3.4)
